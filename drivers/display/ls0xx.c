@@ -64,17 +64,12 @@ LOG_MODULE_REGISTER(ls0xx, CONFIG_DISPLAY_LOG_LEVEL);
 #define LS0XX_BIT_CLEAR       0x04
 /** @} */
 
-/**
- * @brief Global buffer for rotated data.
- * @todo Move to a per-instance structure if multi-display support is needed.
+/*
+ * No frame buffers of our own (they were 2 x 22.5 KB of internal RAM). LVGL renders in
+ * partial mode into its draw buffer, converts it to this panel's format in place
+ * (lvgl_transform_buffer) and redraws the whole area before every flush, so the driver
+ * may rotate that buffer in place and send it directly.
  */
-static uint8_t rotated_buf[LS0XX_PANEL_WIDTH / 8 * LS0XX_PANEL_HEIGHT];
-
-/**
- * @brief Local buffer for incoming display data.
- * @todo Consider if memcpy and this buffer are strictly necessary, or if we can process in-place.
- */
-static uint8_t local_buf[LS0XX_PANEL_WIDTH / 8 * LS0XX_PANEL_HEIGHT];
 
 /**
  * @brief Driver configuration structure.
@@ -308,17 +303,22 @@ static int ls0xx_update_display(const struct device *dev,
  * @param width Width of the image in pixels.
  * @param height Height of the image in pixels.
  */
-static void rotate180_a1(const uint8_t *src, uint8_t *dst, int32_t width, int32_t height)
+/* Rotate an A1 block by 180 degrees in place: byte i <-> byte n-1-i, bits reversed. Same
+ * result as the old copy into a second buffer (dst[n-1-i] = RBIT(src[i])). */
+static void rotate180_a1_inplace(uint8_t *buf, int32_t width, int32_t height)
 {
-	int32_t line_bytes = width / 8;
-        const uint8_t *src_line = src;
-        uint8_t *dst_line = dst + (height - 1) * line_bytes;
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x < line_bytes; x++) {
-		        dst_line[line_bytes - 1 - x] = (uint8_t)(__RBIT(src_line[x]) >> 24);
-		}
-        src_line += line_bytes;
-		dst_line -= line_bytes;
+	size_t n = (size_t)(width / 8) * (size_t)height;
+	uint8_t *lo = buf;
+	uint8_t *hi = buf + n - 1;
+
+	while (lo < hi) {
+		uint8_t a = (uint8_t)(__RBIT(*lo) >> 24);
+		uint8_t b = (uint8_t)(__RBIT(*hi) >> 24);
+		*lo++ = b;
+		*hi-- = a;
+	}
+	if (lo == hi) {
+		*lo = (uint8_t)(__RBIT(*lo) >> 24);
 	}
 }
 
@@ -346,7 +346,8 @@ static int ls0xx_write(const struct device *dev, const uint16_t x,
 	}
 
     size_t buf_size = desc->width * desc->height / 8;
-    memcpy(local_buf, buf, buf_size);
+    /* LVGL's draw buffer; see the note at the top - rotated in place, sent directly. */
+    uint8_t *data = (uint8_t *)buf;
 
     /* Get current rotation from LVGL.
      * @todo Check if we should use the display-specific rotation if available.
@@ -358,11 +359,11 @@ static int ls0xx_write(const struct device *dev, const uint16_t x,
 #ifdef DISPLAY_DRV_DEBUG
         LOG_INF("ROTATING: x=%d, y=%d, w=%d, h=%d, pitch=%d", x, y, desc->width, desc->height, desc->pitch);
 #endif
-        log_buf_head("INPUT BUF", local_buf, buf_size);
+        log_buf_head("INPUT BUF", data, buf_size);
 
         /* Custom rotation for A1 format */
-        rotate180_a1(local_buf, rotated_buf, desc->width, desc->height);
-        log_buf_head("ROTATED BUF", rotated_buf, buf_size);
+        rotate180_a1_inplace(data, desc->width, desc->height);
+        log_buf_head("ROTATED BUF", data, buf_size);
 
         /* Calculate new Y position for 180-degree rotation.
          * The coordinate system is flipped vertically.
@@ -374,13 +375,13 @@ static int ls0xx_write(const struct device *dev, const uint16_t x,
 #endif
 
         /* Adding 1 because Sharp display line numbering starts at 1 */
-        ls0xx_update_display(dev, new_y + 1, desc->height, rotated_buf);
+        ls0xx_update_display(dev, new_y + 1, desc->height, data);
     } else {
 #ifdef DISPLAY_DRV_DEBUG
         LOG_INF("NOT ROTATING: x=%d, y=%d, w=%d, h=%d", x, y, desc->width, desc->height);
 #endif
         /* Standard update without rotation */
-	    ls0xx_update_display(dev, y + 1, desc->height, local_buf);
+	    ls0xx_update_display(dev, y + 1, desc->height, data);
     }
 
     lv_disp_flush_ready(disp);
